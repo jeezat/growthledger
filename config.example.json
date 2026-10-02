@@ -1,0 +1,9 @@
+{
+  "default_currency": "EUR",
+  "ticker": "",
+  "isin": "IE00B4L5Y983",
+  "etf_name": "Core MSCI World USD (Acc)",
+  "exchange": "",
+  "price_provider": "manual"
+}
+

@@ -1,0 +1,3 @@
+datetime,date,account_type,category,type,asset_class,name,symbol,shares,price,amount,fee,tax,currency,original_amount,original_currency,fx_rate,description,transaction_id,counterparty_name,counterparty_iban,payment_reference,mcc_code
+2025-01-02T09:00:00+00:00,2025-01-02,CASH,CASH,CUSTOMER_INPAYMENT,,,,,,25.000000,0,0,EUR,,,,Direct Debit Top up,sample-tr-deposit-001,,,,
+2025-01-03T10:30:00+00:00,2025-01-03,SECURITIES,TRADING,BUY,FUND,Core MSCI World USD (Acc),IE00B4L5Y983,0.1917700000,130.3639000000,,0,0,EUR,,,,BUY IE00B4L5Y983,sample-tr-buy-001,,,,

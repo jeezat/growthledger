@@ -1,0 +1,14 @@
+data/
+export/
+*.csv
+*.json
+.env
+__pycache__/
+*.pyc
+.coverage
+SPECIFICATION.md
+
+# Anonymisierte, bewusst versionierte Beispiele
+!config.example.json
+!examples/*.csv
+
