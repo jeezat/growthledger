@@ -2,7 +2,7 @@
 
 ## Deutsch
 
-GrowthLedger ist eine lokale Python-3-Terminalanwendung zur Verwaltung und Analyse eines ETF-Sparplans. Phase 1 importiert Trade-Republic-CSV-Dateien, erfasst manuelle Transaktionen, erstellt Berichte und Prognosen, zeichnet ASCII-Diagramme und exportiert Tabellen. Sie verwendet ausschließlich die Python-Standardbibliothek, `Decimal` für Finanzwerte und **keinen Internetzugriff**.
+GrowthLedger ist eine lokale Python-3-Terminalanwendung zur Verwaltung und Analyse eines ETF-Sparplans. Sie importiert Trade-Republic-CSV-Dateien, erfasst manuelle Transaktionen, erstellt Berichte und Prognosen, zeichnet ASCII-Diagramme und exportiert Tabellen. Phase 2 kann auf ausdrücklichen Befehl Marktpreise von Alpha Vantage oder Twelve Data abrufen. Die Anwendung verwendet ausschließlich die Python-Standardbibliothek und `Decimal` für Finanzwerte.
 
 > GrowthLedger ist ein Rechen- und Dokumentationswerkzeug, keine Finanzberatung. Prognosen sind keine Renditegarantie. Märkte schwanken und Verluste sind möglich.
 
@@ -110,7 +110,7 @@ Gegenpartei, IBAN, Zahlungsreferenz und MCC werden nicht gespeichert oder ausgeg
 - Das Trade-Republic-Feld `symbol` kann eine ISIN wie `IE00B4L5Y983` enthalten; gültige ISINs werden zusätzlich im ISIN-Feld gespeichert.
 - Ist `amount` vorhanden, gilt `amount_source=csv`. Fehlt er bei Kauf oder Verkauf, wird exakt `shares * price` mit `Decimal` berechnet und `amount_source=calculated` gesetzt.
 
-`buy_price` beziehungsweise `sell_price` ist der tatsächliche Broker-Ausführungskurs. `market_price` ist ausschließlich ein manueller Bewertungs-, Stichtags- oder Monatsendkurs. Ein Marktpreis überschreibt nie den Kaufkurs. Automatische Marktpreise gibt es in Phase 1 nicht.
+`buy_price` beziehungsweise `sell_price` ist der tatsächliche Broker-Ausführungskurs. `market_price` ist ausschließlich ein manueller oder automatisch abgerufener Bewertungs-, Stichtags- oder Monatsendkurs. Ein Marktpreis überschreibt nie den Kaufkurs.
 
 ### Berechnungen
 
@@ -143,6 +143,49 @@ Der Benutzerexport ist eine UTF-8-CSV **mit BOM und Semikolon als Trennzeichen**
 
 Broker-CSV-Dateien und `data/` enthalten sensible Finanzdaten. Sie gehören nicht in öffentliche Repositories oder unverschlüsselte Freigaben. `.gitignore` schließt Daten, Exporte, beliebige CSV/JSON, `.env`, Bytecode und Caches aus; nur die anonymisierte Beispieldatei und Konfigurationsvorlage sind freigegeben. GrowthLedger speichert weder Gegenpartei noch IBAN und niemals API-Schlüssel oder Passwörter.
 
+### Roadmap: Phase 2 – Automatischer Kursabruf (umgesetzt)
+
+Unterstützte Anbieter sind Alpha Vantage und Twelve Data. Lege den jeweiligen Schlüssel ausschließlich als Umgebungsvariable fest:
+
+```bash
+export ALPHA_VANTAGE_API_KEY="..."
+python3 growthledger.py update-prices --provider alpha_vantage --symbol EUNL.DEX --history
+
+export TWELVE_DATA_API_KEY="..."
+python3 growthledger.py update-prices --provider twelve_data --symbol EUNL:XETR --history
+```
+
+`--symbol` ist der anbieterspezifische Ticker. Bei genau einer vorhandenen Position wird deren ISIN/Symbol automatisch zugeordnet; sonst ist zusätzlich `--asset-id IE00B4L5Y983` erforderlich. `--history` lädt standardmäßig fünf Jahre Historie und speichert Monatsendkurse; Alpha Vantage nutzt dafür seinen langfristigen Monatsendpunkt. Ohne diese Option wird nur der jüngste Kurs gespeichert. `--start`, `--end`, `--currency` und `--refresh` steuern Zeitraum, Fallback-Währung und Cache-Aktualisierung. Anbieter und Ticker können auch in `data/config.json` gesetzt werden.
+
+Antworten werden ohne API-Schlüssel unter `data/cache/prices/` zwischengespeichert (aktuelle Kurse 15 Minuten, Historie 24 Stunden). API-, Netzwerk-, Symbol- und Ratenlimitfehler führen zu verständlichen Fehlermeldungen und verändern bestehende Transaktionen nicht. Automatische Datensätze erhalten `source=market_api`, `price_capture=automatic` und den Anbieter als `price_source`. Broker-Kaufkurse bleiben unverändert.
+
+Nach mindestens zwei Marktpreisen über mindestens 30 Tage zeigt `chart` standardmäßig einen Vergleich aus annualisierter historischer Kurssteigerung (CAGR), 3 %, 5 % und 7 %. `forecast` verwendet ohne Renditeparameter denselben Szenarienvergleich. `--return` beziehungsweise `--returns` überschreibt diese Auswahl. Die Historie ist keine Vorhersage oder Garantie.
+
+### Changelog
+
+#### Phase 1 – Lokale Grundlage
+
+- Lokale, deutschsprachige Terminalanwendung ausschließlich mit der Python-Standardbibliothek und `Decimal`.
+- Sicherer Trade-Republic-CSV-Import mit Preview, Dry-run, Duplikaterkennung und atomarer Speicherung.
+- Manuelle Erfassung von Einzahlungen, Auszahlungen, Käufen, Verkäufen, Dividenden, Gebühren und Steuern.
+- Bestands-, Depotwert- und vereinfachte Renditeberechnung mit strikter Trennung von Kontoeinzahlung und ETF-Kauf.
+- Berichte, ASCII-Diagramme, Sparplanprognosen und Excel-/ONLYOFFICE-kompatibler CSV-Export.
+- Datenschutz durch Verwerfen sensibler Gegenparteidaten und Ignorieren lokaler Finanzdateien in Git.
+- Vorbereitete abstrakte `PriceProvider`-Schnittstelle, jedoch noch ohne Netzwerk- oder API-Zugriff.
+
+#### Phase 2 – Automatische Kurse und erweiterte Prognosen
+
+- Konkrete Kursanbieter für Alpha Vantage und Twelve Data über die gemeinsame `PriceProvider`-Schnittstelle.
+- API-Schlüssel werden ausschließlich aus `ALPHA_VANTAGE_API_KEY` beziehungsweise `TWELVE_DATA_API_KEY` gelesen und niemals gespeichert.
+- Neuer Befehl `update-prices` für aktuelle Kurse und historische Monatsendkurse.
+- Standardmäßig fünf Jahre Kurshistorie; Alpha Vantage verwendet dafür den langfristigen Monatsendpunkt.
+- Lokaler JSON-Cache ohne Zugangsdaten mit 15 Minuten Gültigkeit für aktuelle und 24 Stunden für historische Abfragen.
+- Automatische Kurse werden ausschließlich als `market_price` mit Anbieter, Kursdatum, Abrufzeitpunkt und `price_capture=automatic` gespeichert. Broker-Kauf- und Verkaufskurse bleiben unverändert.
+- Gegenüberstellung von ETF-Kaufbeträgen und Depotwert inklusive Kursgewinn oder -verlust.
+- Annualisierte historische Kurssteigerung (CAGR) sowie Prognosevergleich mit historischem Wert, 3 %, 5 % und 7 %.
+- Prognosetabelle mit kumulierten künftigen Einzahlungen und prognostiziertem Depotwert je Jahr; vorhandenes Depotvermögen bleibt getrenntes Startkapital.
+- Sicherer Umgang mit Netzwerk-, API-, Symbol- und Ratenlimitfehlern sowie erweiterte netzwerkfreie Tests für beide Anbieter.
+
 ### Tests und Mitwirkung
 
 ```bash
@@ -150,11 +193,7 @@ python3 -m unittest discover -v
 python3 -m py_compile growthledger.py
 ```
 
-Beiträge sollten Standardbibliothek und `Decimal` beibehalten, anonymisierte Tests ergänzen, keinen Netzwerkzugriff in Phase 1 einführen und `python3 growthledger.py --help` funktionsfähig halten. Fehlerberichte dürfen keine echten Finanzdaten enthalten.
-
-### Roadmap: Phase 2 – Automatischer Kursabruf
-
-Phase 1 definiert nur die abstrakte, dokumentierte `PriceProvider`-Schnittstelle und Felder für Ticker, ISIN, Börsenplatz, Kursquelle, Kursdatum, Abrufzeitpunkt und Erfassungsart. Phase 2 kann Netzwerk-Provider, Tages-/Monatsendkurse und einen lokalen Cache ergänzen. API-Schlüssel sollen dann ausschließlich aus Umgebungsvariablen kommen; Netzwerk- und Anbieterfehler müssen sicher behandelt werden. Broker-Kaufkurse bleiben unveränderlich und abgerufene Werte werden nur als `market_price` gespeichert. **Phase 1 ruft keine Kurse automatisch ab.**
+Beiträge sollten Standardbibliothek und `Decimal` beibehalten, anonymisierte und netzwerkfreie Tests ergänzen und `python3 growthledger.py --help` funktionsfähig halten. Fehlerberichte dürfen keine echten Finanzdaten oder API-Schlüssel enthalten.
 
 ### Lizenz
 
@@ -164,7 +203,7 @@ MIT License, Copyright © 2026 GrowthLedger Contributors. Siehe `LICENSE`.
 
 ## English
 
-GrowthLedger is a local Python 3 terminal application for managing and analysing an ETF savings plan. Phase 1 imports Trade Republic CSV files, records manual transactions, creates reports and forecasts, draws ASCII charts, and exports tables. It uses only the Python standard library, `Decimal` for financial values, and **no internet access**.
+GrowthLedger is a local Python 3 terminal application for managing and analysing an ETF savings plan. It imports Trade Republic CSV files, records manual transactions, creates reports and forecasts, draws ASCII charts, and exports tables. Phase 2 can retrieve market prices from Alpha Vantage or Twelve Data when explicitly requested. It uses only the Python standard library and `Decimal` for financial values.
 
 > GrowthLedger is a calculation and record-keeping tool, not financial advice. Forecasts are not return guarantees. Markets fluctuate and losses are possible.
 
@@ -272,7 +311,7 @@ Counterparty, IBAN, payment reference, and MCC are neither stored nor displayed.
 - Trade Republic's `symbol` field may contain an ISIN such as `IE00B4L5Y983`; valid ISINs are also stored in the ISIN field.
 - If `amount` is present, `amount_source=csv`. If it is absent for a purchase or sale, exact `shares * price` is calculated with `Decimal` and `amount_source=calculated` is stored.
 
-`buy_price` or `sell_price` is the actual broker execution price. `market_price` is exclusively a manual valuation, cut-off-date, or month-end price. A market price never overwrites a purchase price. Phase 1 has no automatic market prices.
+`buy_price` or `sell_price` is the actual broker execution price. `market_price` is exclusively a manual or automatically retrieved valuation, cut-off-date, or month-end price. A market price never overwrites a purchase price.
 
 ### Calculations
 
@@ -305,6 +344,49 @@ The user export is a UTF-8 CSV **with BOM and semicolon delimiter** for Excel an
 
 Broker CSV files and `data/` contain sensitive financial information. Do not put them in public repositories or unencrypted shares. `.gitignore` excludes data, exports, arbitrary CSV/JSON, `.env`, bytecode, and caches; only the anonymised sample and configuration template are allowed. GrowthLedger stores neither counterparties nor IBANs, and never API keys or passwords.
 
+### Roadmap: Phase 2 – Automatic price retrieval (implemented)
+
+Supported providers are Alpha Vantage and Twelve Data. Set the applicable key exclusively as an environment variable:
+
+```bash
+export ALPHA_VANTAGE_API_KEY="..."
+python3 growthledger.py update-prices --provider alpha_vantage --symbol EUNL.DEX --history
+
+export TWELVE_DATA_API_KEY="..."
+python3 growthledger.py update-prices --provider twelve_data --symbol EUNL:XETR --history
+```
+
+`--symbol` is the provider-specific ticker. With exactly one existing position, its ISIN/symbol is assigned automatically; otherwise also pass `--asset-id IE00B4L5Y983`. `--history` retrieves five years of history by default and stores month-end prices; Alpha Vantage uses its long-term monthly endpoint. Without it, only the latest price is stored. `--start`, `--end`, `--currency`, and `--refresh` control the period, fallback currency, and cache refresh. Provider and ticker can also be set in `data/config.json`.
+
+Responses are cached without API keys under `data/cache/prices/` (current prices for 15 minutes, history for 24 hours). API, network, symbol, and rate-limit errors produce understandable messages and do not alter existing transactions. Automatic records receive `source=market_api`, `price_capture=automatic`, and the provider as `price_source`. Broker purchase prices remain unchanged.
+
+After at least two market prices spanning at least 30 days, `chart` shows a default comparison of annualised historical price growth (CAGR), 3%, 5%, and 7%. Without return parameters, `forecast` uses the same scenario comparison. `--return` or `--returns` overrides this selection. Historical growth is not a prediction or guarantee.
+
+### Changelog
+
+#### Phase 1 – Local foundation
+
+- Local German-language terminal application using only the Python standard library and `Decimal`.
+- Safe Trade Republic CSV import with preview, dry-run, duplicate detection, and atomic storage.
+- Manual entry of deposits, withdrawals, purchases, sales, dividends, fees, and taxes.
+- Holdings, portfolio value, and simplified return calculations with strict separation of cash deposits and ETF purchases.
+- Reports, ASCII charts, savings-plan forecasts, and Excel-/ONLYOFFICE-compatible CSV export.
+- Privacy protection by discarding sensitive counterparty data and excluding local financial files from Git.
+- Prepared abstract `PriceProvider` interface, but no network or API access yet.
+
+#### Phase 2 – Automatic prices and extended forecasts
+
+- Concrete Alpha Vantage and Twelve Data providers using the shared `PriceProvider` interface.
+- API keys are read exclusively from `ALPHA_VANTAGE_API_KEY` or `TWELVE_DATA_API_KEY` and are never stored.
+- New `update-prices` command for current prices and historical month-end prices.
+- Five years of price history by default; Alpha Vantage uses its long-term monthly endpoint.
+- Local credential-free JSON cache with a 15-minute lifetime for current and 24-hour lifetime for historical requests.
+- Automatic prices are stored only as `market_price`, including provider, price date, retrieval timestamp, and `price_capture=automatic`. Broker purchase and sale prices remain unchanged.
+- Comparison of ETF purchase amounts and portfolio value, including price gain or loss.
+- Annualised historical price growth (CAGR) plus a forecast comparison using the historical value, 3%, 5%, and 7%.
+- Forecast table with cumulative future contributions and projected portfolio value for every year; existing portfolio value remains separate starting capital.
+- Safe handling of network, API, symbol, and rate-limit errors, plus extended network-free tests for both providers.
+
 ### Tests and contributing
 
 ```bash
@@ -312,11 +394,7 @@ python3 -m unittest discover -v
 python3 -m py_compile growthledger.py
 ```
 
-Contributions should retain standard-library-only operation and `Decimal`, add anonymised tests, introduce no Phase 1 networking, and keep `python3 growthledger.py --help` working. Bug reports must not contain real financial data.
-
-### Roadmap: Phase 2 – Automatic price retrieval
-
-Phase 1 defines only the abstract, documented `PriceProvider` interface and fields for ticker, ISIN, exchange, price source, price date, retrieval timestamp, and capture type. Phase 2 can add network providers, daily/month-end prices, and a local cache. API keys must then come exclusively from environment variables; network and provider failures must be handled safely. Broker purchase prices remain immutable and fetched values are stored only as `market_price`. **Phase 1 performs no automatic price retrieval.**
+Contributions should retain standard-library-only operation and `Decimal`, add anonymised network-free tests, and keep `python3 growthledger.py --help` working. Bug reports must not contain real financial data or API keys.
 
 ### License
 

@@ -3,6 +3,7 @@ import inspect
 import io
 import tempfile
 import unittest
+from unittest import mock
 from argparse import Namespace
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -238,7 +239,9 @@ class StorageForecastExportAndCliTests(unittest.TestCase):
     def test_forecast_one_and_multiple_scenarios(self):
         one = gl.forecast(Decimal("25"), 1, Decimal("0"), Decimal("100"))
         self.assertEqual(one.final_value, Decimal("400"))
-        self.assertEqual(one.total_contributions, Decimal("400"))
+        self.assertEqual(one.total_contributions, Decimal("300"))
+        self.assertEqual(one.years[0].contributions, Decimal("300"))
+        self.assertEqual(one.growth, Decimal("0"))
         scenarios = [gl.forecast(Decimal("25"), 2, rate) for rate in (Decimal("3"), Decimal("5"), Decimal("7"))]
         self.assertEqual(len(scenarios), 3)
         self.assertLess(scenarios[0].final_value, scenarios[1].final_value)
@@ -260,6 +263,83 @@ class StorageForecastExportAndCliTests(unittest.TestCase):
             self.assertEqual(gl.main(["--data-dir", directory, "sample-data"]), 0)
             self.assertEqual(len(gl.CSVStorage(directory).load()), 2)
             self.assertEqual(gl.main(["--data-dir", directory, "sample-data"]), 2)
+
+
+class PhaseTwoTests(unittest.TestCase):
+    def test_alpha_vantage_parsing(self):
+        provider = gl.AlphaVantageProvider("secret", "EUR")
+        with mock.patch("growthledger.fetch_json", return_value={"Global Quote": {"05. price": "123.4567", "07. latest trading day": "2026-10-01"}}):
+            quote = provider.current_price("ETF.DEX")
+        self.assertEqual(quote.price, Decimal("123.4567"))
+        self.assertEqual(quote.price_date, "2026-10-01")
+        with mock.patch("growthledger.fetch_json", return_value={"Time Series (Daily)": {
+            "2026-09-30": {"4. close": "120.1"}, "2026-10-01": {"4. close": "123.4567"}}}):
+            history = provider.historical_prices("ETF.DEX", "2026-09-01", "2026-10-01")
+        self.assertEqual([item.price for item in history], [Decimal("120.1"), Decimal("123.4567")])
+        with mock.patch("growthledger.fetch_json", return_value={"Monthly Time Series": {
+            "2021-10-29": {"4. close": "70"}, "2026-09-30": {"4. close": "120"}}}) as fetch:
+            long_history = provider.historical_prices("ETF.DEX", "2021-10-01", "2026-10-01")
+        self.assertEqual([item.price for item in long_history], [Decimal("70"), Decimal("120")])
+        self.assertIn("TIME_SERIES_MONTHLY", fetch.call_args.args[0])
+
+    def test_twelve_data_parsing_and_api_error(self):
+        provider = gl.TwelveDataProvider("secret", "EUR")
+        payload = {"meta": {"currency": "EUR"}, "values": [{"datetime": "2026-10-01", "close": "99.5"}]}
+        with mock.patch("growthledger.fetch_json", return_value=payload):
+            self.assertEqual(provider.current_price("ETF").price, Decimal("99.5"))
+        with mock.patch("growthledger.fetch_json", return_value={"status": "error", "code": 401}):
+            with self.assertRaises(gl.GrowthLedgerError):
+                provider.current_price("ETF")
+
+    def test_month_end_cache_sync_and_historical_return(self):
+        quotes = [
+            gl.PriceQuote("ETF", Decimal("100"), "EUR", "2025-01-02", "2025-01-02T12:00:00+00:00", "test"),
+            gl.PriceQuote("ETF", Decimal("101"), "EUR", "2025-01-31", "2025-01-31T12:00:00+00:00", "test"),
+            gl.PriceQuote("ETF", Decimal("110"), "EUR", "2026-01-31", "2026-01-31T12:00:00+00:00", "test"),
+        ]
+        self.assertEqual([item.price_date for item in gl.month_end_quotes(quotes)], ["2025-01-31", "2026-01-31"])
+        with tempfile.TemporaryDirectory() as directory:
+            storage = gl.CSVStorage(Path(directory) / "data")
+            purchase = tx("buy", "etf_buy", shares=Decimal("1"), amount=Decimal("100"), buy=Decimal("100"), symbol="ETF")
+            storage.save([purchase])
+            self.assertEqual(gl.sync_market_prices(storage, quotes, "ETF.API", "ETF"), 3)
+            loaded = storage.load()
+            self.assertEqual(next(item for item in loaded if item.transaction_id == "buy").buy_price, Decimal("100"))
+            self.assertEqual(gl.summarize(loaded).portfolio_value, Decimal("110"))
+            annual = gl.historical_annual_return(loaded)
+            self.assertIsNotNone(annual)
+            self.assertGreater(annual, Decimal("9"))
+            self.assertLess(annual, Decimal("11"))
+            self.assertEqual(gl.sync_market_prices(storage, quotes, "ETF.API", "ETF"), 3)
+            self.assertEqual(len(storage.load()), 4)
+
+    def test_missing_api_keys_are_rejected(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(gl.GrowthLedgerError):
+                gl.make_price_provider("alpha_vantage", "EUR", Path("unused"), False)
+
+    def test_chart_comparison_and_automatic_forecast_return(self):
+        quotes = [
+            gl.PriceQuote("ETF", Decimal("100"), "EUR", "2025-01-31", "2025-01-31T12:00:00+00:00", "test"),
+            gl.PriceQuote("ETF", Decimal("110"), "EUR", "2026-01-31", "2026-01-31T12:00:00+00:00", "test"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            storage = gl.CSVStorage(directory)
+            storage.save([tx("buy", "etf_buy", shares=Decimal("1"), amount=Decimal("100"), buy=Decimal("100"), symbol="ETF", date="2025-01-01")])
+            gl.sync_market_prices(storage, quotes, "ETF", "ETF")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(gl.main(["--data-dir", directory, "chart", "--years", "1"]), 0)
+                self.assertEqual(gl.main(["--data-dir", directory, "forecast", "--monthly", "25", "--years", "1"]), 0)
+            rendered = output.getvalue()
+            self.assertIn("Eingezahlter Betrag <-> Eingezahlter Betrag + Kursgewinn", rendered)
+            self.assertIn("Historische annualisierte Kurssteigerung", rendered)
+            self.assertIn("Szenarienvergleich", rendered)
+            self.assertIn("künftig 25,00 EUR pro Monat", rendered)
+            self.assertIn("Einzahlungen kum.", rendered)
+            self.assertIn("3 %", rendered)
+            self.assertIn("5 %", rendered)
+            self.assertIn("7 %", rendered)
 
 
 if __name__ == "__main__":

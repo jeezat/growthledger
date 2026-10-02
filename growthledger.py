@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""GrowthLedger – lokale Verwaltung und Analyse eines ETF-Sparplans (Phase 1)."""
+"""GrowthLedger – lokale Verwaltung und Analyse eines ETF-Sparplans."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, fields
 from datetime import date as Date, datetime, timezone
@@ -23,7 +28,7 @@ APP_NAME = "GrowthLedger"
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 TRANSACTION_TYPES = {
     "cash_deposit", "cash_withdrawal", "etf_buy", "etf_sell",
-    "dividend", "fee", "tax", "unknown",
+    "dividend", "fee", "tax", "market_price", "unknown",
 }
 ZERO = Decimal("0")
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
@@ -211,20 +216,127 @@ class PriceQuote:
 
 
 class PriceProvider(ABC):
-    """Kursquellen-Vertrag für Phase 2; Phase 1 enthält keine Netzimplementierung."""
+    """Einheitlicher Vertrag für austauschbare Marktpreisquellen."""
 
     @abstractmethod
     def current_price(self, symbol: str) -> PriceQuote:
-        """Liefert künftig einen aktuellen Kurs oder wirft einen verständlichen Fehler."""
+        """Liefert den aktuellen beziehungsweise jüngsten verfügbaren Kurs."""
         raise NotImplementedError
 
     @abstractmethod
     def historical_prices(self, symbol: str, start: str, end: str) -> list[PriceQuote]:
-        """Liefert künftig historische Kurse für einen Datumsbereich."""
+        """Liefert historische Schlusskurse für einen Datumsbereich."""
         raise NotImplementedError
 
 
-# TODO Phase 2: Netzwerk-Provider und lokalen Kurs-Cache separat implementieren.
+def fetch_json(url: str, timeout: int = 20) -> dict:
+    """Lädt JSON ohne Zugangsdaten in Fehlermeldungen offenzulegen."""
+    request = urllib.request.Request(url, headers={"User-Agent": "GrowthLedger/2"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise GrowthLedgerError(f"Kursanbieter nicht erreichbar oder Antwort ungültig: {type(exc).__name__}") from exc
+
+
+class AlphaVantageProvider(PriceProvider):
+    name = "alpha_vantage"
+
+    def __init__(self, api_key: str, currency: str = "EUR"):
+        if not api_key:
+            raise GrowthLedgerError("Umgebungsvariable ALPHA_VANTAGE_API_KEY fehlt.")
+        self.api_key, self.currency = api_key, currency
+
+    def _query(self, **parameters: str) -> dict:
+        parameters["apikey"] = self.api_key
+        data = fetch_json("https://www.alphavantage.co/query?" + urllib.parse.urlencode(parameters))
+        message = data.get("Error Message") or data.get("Information") or data.get("Note")
+        if message:
+            raise GrowthLedgerError("Alpha Vantage meldet einen API-, Symbol- oder Ratenlimitfehler.")
+        return data
+
+    def current_price(self, symbol: str) -> PriceQuote:
+        data = self._query(function="GLOBAL_QUOTE", symbol=symbol)
+        quote = data.get("Global Quote", {})
+        price = parse_decimal(quote.get("05. price"), "price", allow_empty=False)
+        price_date = validate_date(quote.get("07. latest trading day", ""))
+        return PriceQuote(symbol, price, self.currency, price_date, utc_now(), self.name)
+
+    def historical_prices(self, symbol: str, start: str, end: str) -> list[PriceQuote]:
+        days = (Date.fromisoformat(end) - Date.fromisoformat(start)).days
+        if days > 150:
+            data = self._query(function="TIME_SERIES_MONTHLY", symbol=symbol)
+            series = data.get("Monthly Time Series")
+        else:
+            data = self._query(function="TIME_SERIES_DAILY", symbol=symbol, outputsize="compact")
+            series = data.get("Time Series (Daily)")
+        if not isinstance(series, dict):
+            raise GrowthLedgerError("Alpha Vantage lieferte keine historischen Kurse.")
+        timestamp = utc_now()
+        return [PriceQuote(symbol, parse_decimal(values.get("4. close"), "close", allow_empty=False), self.currency, day, timestamp, self.name)
+                for day, values in sorted(series.items()) if start <= day <= end]
+
+
+class TwelveDataProvider(PriceProvider):
+    name = "twelve_data"
+
+    def __init__(self, api_key: str, currency: str = "EUR"):
+        if not api_key:
+            raise GrowthLedgerError("Umgebungsvariable TWELVE_DATA_API_KEY fehlt.")
+        self.api_key, self.currency = api_key, currency
+
+    def _query(self, endpoint: str, **parameters: str) -> dict:
+        parameters["apikey"] = self.api_key
+        data = fetch_json(f"https://api.twelvedata.com/{endpoint}?" + urllib.parse.urlencode(parameters))
+        if data.get("status") == "error" or data.get("code"):
+            raise GrowthLedgerError("Twelve Data meldet einen API-, Symbol- oder Ratenlimitfehler.")
+        return data
+
+    def current_price(self, symbol: str) -> PriceQuote:
+        data = self._query("time_series", symbol=symbol, interval="1day", outputsize="1", order="DESC")
+        values = data.get("values") or []
+        if not values:
+            raise GrowthLedgerError("Twelve Data lieferte keinen aktuellen Kurs.")
+        item = values[0]
+        day = validate_date(str(item.get("datetime", ""))[:10])
+        currency = data.get("meta", {}).get("currency") or self.currency
+        return PriceQuote(symbol, parse_decimal(item.get("close"), "close", allow_empty=False), currency, day, utc_now(), self.name)
+
+    def historical_prices(self, symbol: str, start: str, end: str) -> list[PriceQuote]:
+        data = self._query("time_series", symbol=symbol, interval="1day", start_date=start, end_date=end, outputsize="5000", order="ASC")
+        timestamp = utc_now()
+        currency = data.get("meta", {}).get("currency") or self.currency
+        return [PriceQuote(symbol, parse_decimal(item.get("close"), "close", allow_empty=False), currency,
+                           validate_date(str(item.get("datetime", ""))[:10]), timestamp, self.name)
+                for item in data.get("values", [])]
+
+
+class CachedPriceProvider(PriceProvider):
+    """Dateibasierter JSON-Cache; API-Schlüssel werden nie gespeichert."""
+
+    def __init__(self, provider: PriceProvider, cache_dir: Path, refresh: bool = False):
+        self.provider, self.cache_dir, self.refresh = provider, cache_dir, refresh
+        self.name = getattr(provider, "name", provider.__class__.__name__)
+
+    def _cached(self, key: str, loader, max_age_seconds: int) -> list[PriceQuote]:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self.cache_dir / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+        if path.exists() and not self.refresh and time.time() - path.stat().st_mtime <= max_age_seconds:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return [PriceQuote(item["symbol"], Decimal(item["price"]), item["currency"], item["price_date"], item["timestamp"], item["source"]) for item in payload]
+            except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                pass
+        quotes = loader()
+        payload = [dict(asdict(item), price=decimal_text(item.price)) for item in quotes]
+        CSVStorage._atomic_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return quotes
+
+    def current_price(self, symbol: str) -> PriceQuote:
+        return self._cached(f"{self.name}:current:{symbol}", lambda: [self.provider.current_price(symbol)], 900)[0]
+
+    def historical_prices(self, symbol: str, start: str, end: str) -> list[PriceQuote]:
+        return self._cached(f"{self.name}:history:{symbol}:{start}:{end}", lambda: self.provider.historical_prices(symbol, start, end), 86400)
 
 
 class CSVStorage:
@@ -537,6 +649,7 @@ class ForecastYear:
 class ForecastScenario:
     annual_return: Decimal
     monthly_rate: Decimal
+    monthly_contribution: Decimal
     total_contributions: Decimal
     final_value: Decimal
     growth: Decimal
@@ -558,10 +671,10 @@ def forecast(monthly: Decimal, years: int, annual_return: Decimal, start_value: 
         for month_index in range(1, years * 12 + 1):
             value = value * (Decimal("1") + monthly_rate) + monthly  # Einzahlung am Monatsende
             if month_index % 12 == 0:
-                paid = start_value + monthly * month_index
-                rows.append(ForecastYear(month_index // 12, paid, value, value - paid))
-        paid = start_value + monthly * years * 12
-        return ForecastScenario(annual_return, monthly_rate, paid, value, value - paid, tuple(rows))
+                paid = monthly * month_index
+                rows.append(ForecastYear(month_index // 12, paid, value, value - start_value - paid))
+        paid = monthly * years * 12
+        return ForecastScenario(annual_return, monthly_rate, monthly, paid, value, value - start_value - paid, tuple(rows))
 
 
 def make_manual_transaction(args: argparse.Namespace, *, interactive: bool = True) -> Transaction:
@@ -695,7 +808,8 @@ def print_report(transactions: Sequence[Transaction]) -> None:
 def print_forecasts(scenarios: Sequence[ForecastScenario]) -> None:
     print("Prognose (Einzahlungen jeweils am Monatsende; unverbindliches Rechenmodell)")
     for scenario in scenarios:
-        print(f"\nJahresrendite {number(scenario.annual_return, 2)} % | Einzahlungen {money(scenario.total_contributions)} | Endwert {money(scenario.final_value)} | Wertzuwachs {money(scenario.growth)}")
+        print(f"\nAnnahme: künftig {money(scenario.monthly_contribution)} pro Monat | Jahresrendite {number(scenario.annual_return, 2)} %")
+        print(f"Einzahlungen gesamt {money(scenario.total_contributions)} | Endwert {money(scenario.final_value)} | Wertzuwachs {money(scenario.growth)}")
         print("Jahr  Einzahlungen       Depotwert       Wertzuwachs")
         for row in scenario.years:
             print(f"{row.year:>4}  {money(row.contributions):>16}  {money(row.value):>16}  {money(row.growth):>16}")
@@ -712,6 +826,21 @@ def ascii_chart(title: str, points: Sequence[tuple[str, Decimal]], width: int = 
         size = int(abs(value) / maximum * width) if maximum else 0
         marker = "#" * size
         print(f"{label[:12]:12} | {marker:<{width}} {number(value, 2)}")
+
+
+def forecast_chart(scenarios: Sequence[tuple[str, ForecastScenario]]) -> None:
+    """Tabellarischer ASCII-Vergleich von Einzahlungen und Renditeszenarien."""
+    print("\nPrognoseentwicklung")
+    if not scenarios:
+        print("  Keine Szenarien verfügbar.")
+        return
+    header = f"{'Jahr':>4} | {'Einzahlungen kum.':>18}" + "".join(f" | {label:>14}" for label, _ in scenarios)
+    print(header)
+    print("-" * len(header))
+    for index, base_row in enumerate(scenarios[0][1].years):
+        values = "".join(f" | {number(scenario.years[index].value, 2):>14}" for _, scenario in scenarios)
+        print(f"{base_row.year:>4} | {number(base_row.contributions, 2):>18}{values}")
+    print("Alle Beträge in EUR; Einzahlungen sind die künftig geplanten kumulierten Sparraten.")
 
 
 def chart_data(transactions: Sequence[Transaction]) -> tuple[list[tuple[str, Decimal]], list[tuple[str, Decimal]]]:
@@ -732,6 +861,78 @@ def chart_data(transactions: Sequence[Transaction]) -> tuple[list[tuple[str, Dec
             if all(key in prices for key, shares in holdings.items() if shares != ZERO):
                 values.append((item.date, sum((shares * prices[key] for key, shares in holdings.items()), ZERO)))
     return bought, values
+
+
+def historical_annual_return(transactions: Sequence[Transaction]) -> Decimal | None:
+    """Annualisierte Kurssteigerung (CAGR) der einzigen aktiven Position."""
+    holdings: dict[str, Decimal] = {}
+    for item in transactions:
+        if item.transaction_type == "etf_buy":
+            holdings[item.asset_key] = holdings.get(item.asset_key, ZERO) + (item.shares or ZERO)
+        elif item.transaction_type == "etf_sell":
+            holdings[item.asset_key] = holdings.get(item.asset_key, ZERO) - (item.shares or ZERO)
+    active = [key for key, shares in holdings.items() if shares != ZERO]
+    if len(active) != 1:
+        return None
+    by_date = {item.price_date or item.date: item.market_price for item in sorted(transactions, key=lambda tx: (tx.date, tx.price_timestamp, tx.transaction_id))
+               if item.asset_key == active[0] and item.market_price is not None}
+    points = sorted(by_date.items())
+    if len(points) < 2 or points[0][1] <= ZERO:
+        return None
+    days = (Date.fromisoformat(points[-1][0]) - Date.fromisoformat(points[0][0])).days
+    if days < 30:
+        return None
+    with localcontext() as context:
+        context.prec = 40
+        return ((points[-1][1] / points[0][1]) ** (Decimal("365") / Decimal(days)) - Decimal("1")) * Decimal("100")
+
+
+def month_end_quotes(quotes: Sequence[PriceQuote]) -> list[PriceQuote]:
+    by_month: dict[str, PriceQuote] = {}
+    for quote in sorted(quotes, key=lambda item: item.price_date):
+        by_month[quote.price_date[:7]] = quote
+    return list(by_month.values())
+
+
+def years_before(value: str, years: int) -> str:
+    current = Date.fromisoformat(value)
+    try:
+        return current.replace(year=current.year - years).isoformat()
+    except ValueError:  # 29. Februar
+        return current.replace(year=current.year - years, day=28).isoformat()
+
+
+def make_price_provider(name: str, currency: str, cache_dir: Path, refresh: bool) -> CachedPriceProvider:
+    if name == "alpha_vantage":
+        provider: PriceProvider = AlphaVantageProvider(os.environ.get("ALPHA_VANTAGE_API_KEY", ""), currency)
+    elif name == "twelve_data":
+        provider = TwelveDataProvider(os.environ.get("TWELVE_DATA_API_KEY", ""), currency)
+    else:
+        raise GrowthLedgerError(f"Unbekannter Kursanbieter: {name}")
+    return CachedPriceProvider(provider, cache_dir, refresh)
+
+
+def sync_market_prices(storage: CSVStorage, quotes: Sequence[PriceQuote], api_symbol: str, asset_id: str) -> int:
+    transactions = storage.load()
+    matching = next((item for item in transactions if item.asset_key == asset_id and item.transaction_type in {"etf_buy", "etf_sell"}), None)
+    name = matching.name if matching else ""
+    exchange = matching.exchange if matching else ""
+    updates: list[Transaction] = []
+    for quote in quotes:
+        digest = hashlib.sha256(f"{quote.source}:{api_symbol}:{asset_id}:{quote.price_date}".encode()).hexdigest()[:24]
+        updates.append(Transaction(
+            transaction_id=f"price-{digest}", date=quote.price_date, datetime=f"{quote.price_date}T00:00:00+00:00",
+            transaction_type="market_price", name=name,
+            symbol=api_symbol if is_isin(asset_id) else asset_id,
+            isin=asset_id if is_isin(asset_id) else "", ticker=api_symbol, exchange=exchange,
+            market_price=quote.price, currency=quote.currency,
+            description=f"Automatischer Schlusskurs für {api_symbol}", source="market_api",
+            price_source=quote.source, price_date=quote.price_date,
+            price_timestamp=quote.timestamp, price_capture="automatic", imported_at=utc_now(),
+        ))
+    update_ids = {item.transaction_id for item in updates}
+    storage.save([item for item in transactions if item.transaction_id not in update_ids] + updates)
+    return len(updates)
 
 
 EXPORT_FIELDS = [
@@ -778,7 +979,7 @@ def sample_transactions() -> list[Transaction]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="GrowthLedger – lokale ETF-Sparplanverwaltung (Phase 1, ohne automatischen Kursabruf)")
+    parser = argparse.ArgumentParser(description="GrowthLedger – lokale ETF-Sparplanverwaltung mit optionalem automatischem Kursabruf")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="Lokales Datenverzeichnis (Standard: data/ neben dem Programm)")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -812,7 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
     projection = sub.add_parser("forecast", help="Sparplan-Szenarien berechnen")
     projection.add_argument("--monthly", required=True, help="Monatliche Einzahlung")
     projection.add_argument("--years", required=True, type=int, help="Laufzeit in Jahren")
-    rates = projection.add_mutually_exclusive_group(required=True)
+    rates = projection.add_mutually_exclusive_group()
     rates.add_argument("--return", dest="single_return", help="Angenommene Jahresrendite in Prozent")
     rates.add_argument("--returns", nargs="+", help="Mehrere Jahresrenditen in Prozent")
     projection.add_argument("--start-value", help="Optionaler Startwert; sonst vorhandener Depotwert")
@@ -820,7 +1021,17 @@ def build_parser() -> argparse.ArgumentParser:
     chart = sub.add_parser("chart", help="ASCII-Diagramme anzeigen")
     chart.add_argument("--monthly", default="25", help="Monatsrate für Prognosechart")
     chart.add_argument("--years", type=int, default=10, help="Jahre für Prognosechart")
-    chart.add_argument("--return", dest="annual_return", default="5", help="Jahresrendite für Prognosechart")
+    chart.add_argument("--return", dest="annual_return", help="Jahresrendite; ohne Angabe wird die historische Kurssteigerung verwendet")
+
+    prices = sub.add_parser("update-prices", help="Aktuelle und optional historische Marktpreise abrufen")
+    prices.add_argument("--provider", choices=["alpha_vantage", "twelve_data"], help="Kursanbieter; sonst config.json")
+    prices.add_argument("--symbol", help="Anbieter-Ticker, z. B. EUNL.DEX; sonst config.json")
+    prices.add_argument("--asset-id", help="ISIN/Symbol der bestehenden Position; bei genau einer Position automatisch")
+    prices.add_argument("--history", action="store_true", help="Zusätzlich Monatsendkurse seit dem ersten Kauf abrufen")
+    prices.add_argument("--start", help="Startdatum für historische Kurse")
+    prices.add_argument("--end", help="Enddatum für historische Kurse (Standard: heute)")
+    prices.add_argument("--currency", help="Fallback-Währung (Standard: config.json/EUR)")
+    prices.add_argument("--refresh", action="store_true", help="Lokalen Cache umgehen")
 
     export = sub.add_parser("export", help="Excel-/ONLYOFFICE-kompatible CSV exportieren")
     export.add_argument("--output", required=True, type=Path)
@@ -862,7 +1073,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             transactions = storage.load()
             current_value = summarize(transactions).portfolio_value
             start = parse_decimal(args.start_value, "start_value") if args.start_value is not None else (current_value or ZERO)
-            raw_rates = [args.single_return] if args.single_return is not None else args.returns
+            if args.single_return is not None:
+                raw_rates = [args.single_return]
+            elif args.returns:
+                raw_rates = args.returns
+            else:
+                calculated_return = historical_annual_return(transactions)
+                raw_rates = ["3", "5", "7"]
+                if calculated_return is not None:
+                    raw_rates.insert(0, decimal_text(calculated_return))
+                    print(f"Historische annualisierte Kurssteigerung im Szenarienvergleich: {number(calculated_return, 2)} %")
+                else:
+                    print("Keine ausreichende Marktpreishistorie; Vergleich verwendet 3 %, 5 % und 7 %.")
+                raw_rates = list(dict.fromkeys(raw_rates))
             scenarios = [forecast(monthly, args.years, parse_decimal(rate, "return", allow_empty=False), start) for rate in raw_rates]
             print_forecasts(scenarios)
         elif args.command == "chart":
@@ -871,13 +1094,59 @@ def main(argv: Sequence[str] | None = None) -> int:
             ascii_chart("Kumulierte ETF-Käufe", buys)
             ascii_chart("Historische Depotwerte (nur vorhandene Marktpreise)", values)
             summary = summarize(transactions)
-            comparison = [("Investiert", summary.buy_amounts)]
+            comparison = [("Eingezahlt", summary.buy_amounts)]
             if summary.portfolio_value is not None:
-                comparison.append(("Depotwert", summary.portfolio_value))
-            ascii_chart("Investierter Betrag und Depotwert", comparison)
-            scenario = forecast(parse_decimal(args.monthly, "monthly", allow_empty=False), args.years, parse_decimal(args.annual_return, "return", allow_empty=False), summary.portfolio_value or ZERO)
-            ascii_chart("Prognoseentwicklung", [(f"Jahr {row.year}", row.value) for row in scenario.years])
+                comparison.append(("Einz.+Gewinn", summary.portfolio_value))
+            ascii_chart("Eingezahlter Betrag <-> Eingezahlter Betrag + Kursgewinn", comparison)
+            if summary.portfolio_value is not None:
+                print(f"Kursgewinn/-verlust gegenüber ETF-Kaufbeträgen: {money(summary.portfolio_value - summary.buy_amounts)}")
+            calculated_return = historical_annual_return(transactions)
+            monthly = parse_decimal(args.monthly, "monthly", allow_empty=False)
+            if args.annual_return is not None:
+                annual_return = parse_decimal(args.annual_return, "return", allow_empty=False)
+                scenario_pairs = [(f"Manuell {number(annual_return, 2)}%", forecast(monthly, args.years, annual_return, summary.portfolio_value or ZERO))]
+                print(f"Prognoserendite (manuell): {number(annual_return, 2)} % p. a.")
+            else:
+                scenario_pairs: list[tuple[str, ForecastScenario]] = []
+                if calculated_return is not None:
+                    scenario_pairs.append((f"Histor. {number(calculated_return, 2)}%", forecast(monthly, args.years, calculated_return, summary.portfolio_value or ZERO)))
+                    print(f"Historische annualisierte Kurssteigerung: {number(calculated_return, 2)} % p. a.")
+                for fixed_rate in (Decimal("3"), Decimal("5"), Decimal("7")):
+                    if calculated_return is None or abs(calculated_return - fixed_rate) > Decimal("0.005"):
+                        scenario_pairs.append((f"{number(fixed_rate, 0)} %", forecast(monthly, args.years, fixed_rate, summary.portfolio_value or ZERO)))
+            print(f"Prognoseannahme: künftig {money(scenario_pairs[0][1].monthly_contribution)} pro Monat; historische Transaktionen bleiben unverändert.")
+            forecast_chart(scenario_pairs)
             print("\nPrognose ist unverbindlich, keine Finanzberatung oder Garantie; Verluste sind möglich.")
+        elif args.command == "update-prices":
+            storage.ensure()
+            try:
+                config = json.loads(storage.config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise GrowthLedgerError(f"Konfiguration konnte nicht gelesen werden: {exc}") from exc
+            transactions = storage.load()
+            provider_name = args.provider or config.get("price_provider")
+            if provider_name in {None, "", "manual"}:
+                raise GrowthLedgerError("Kursanbieter fehlt. --provider alpha_vantage oder twelve_data angeben.")
+            api_symbol = args.symbol or config.get("ticker")
+            if not api_symbol:
+                raise GrowthLedgerError("Anbieter-Ticker fehlt. --symbol angeben oder ticker in data/config.json setzen.")
+            assets = sorted({item.asset_key for item in transactions if item.transaction_type in {"etf_buy", "etf_sell"}})
+            asset_id = args.asset_id or (assets[0] if len(assets) == 1 else "")
+            if not asset_id:
+                raise GrowthLedgerError("Position nicht eindeutig. --asset-id mit ISIN oder gespeichertem Symbol angeben.")
+            currency = args.currency or config.get("default_currency") or "EUR"
+            provider = make_price_provider(provider_name, currency, storage.data_dir / "cache" / "prices", args.refresh)
+            end = validate_date(args.end or Date.today().isoformat())
+            quotes: list[PriceQuote] = []
+            if args.history:
+                start = validate_date(args.start or years_before(end, 5))
+                if start > end:
+                    raise GrowthLedgerError("Startdatum darf nicht nach dem Enddatum liegen.")
+                quotes.extend(month_end_quotes(provider.historical_prices(api_symbol, start, end)))
+            quotes.append(provider.current_price(api_symbol))
+            quotes = list({quote.price_date: quote for quote in quotes}.values())
+            count = sync_market_prices(storage, sorted(quotes, key=lambda item: item.price_date), api_symbol, asset_id)
+            print(f"{count} Marktpreis(e) für {api_symbol} gespeichert/aktualisiert ({provider_name}).")
         elif args.command == "export":
             output = export_csv(storage.load(), args.output)
             print(f"Export geschrieben: {output}")
