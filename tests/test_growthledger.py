@@ -242,6 +242,9 @@ class StorageForecastExportAndCliTests(unittest.TestCase):
         self.assertEqual(one.total_contributions, Decimal("300"))
         self.assertEqual(one.years[0].contributions, Decimal("300"))
         self.assertEqual(one.growth, Decimal("0"))
+        with_history = gl.forecast(Decimal("50"), 1, Decimal("0"), Decimal("125"), Decimal("125"))
+        self.assertEqual(with_history.historical_contributions, Decimal("125"))
+        self.assertEqual(with_history.years[0].contributions, Decimal("725"))
         scenarios = [gl.forecast(Decimal("25"), 2, rate) for rate in (Decimal("3"), Decimal("5"), Decimal("7"))]
         self.assertEqual(len(scenarios), 3)
         self.assertLess(scenarios[0].final_value, scenarios[1].final_value)
@@ -340,6 +343,8 @@ class PhaseTwoTests(unittest.TestCase):
             self.assertIn("3 %", rendered)
             self.assertIn("5 %", rendered)
             self.assertIn("7 %", rendered)
+            today_line = next(line for line in rendered.splitlines() if line.strip().startswith("Heute"))
+            self.assertEqual(today_line.count("110"), 1)
 
 
 if __name__ == "__main__":

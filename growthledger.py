@@ -637,6 +637,11 @@ def summarize(transactions: Sequence[Transaction]) -> PortfolioSummary:
     )
 
 
+def contribution_baseline(summary: PortfolioSummary) -> Decimal:
+    """Tatsächliche CSV-Einzahlungen; Kaufbeträge dienen nur als Fallback."""
+    return summary.deposits if summary.deposits > ZERO else summary.buy_amounts
+
+
 @dataclass(frozen=True)
 class ForecastYear:
     year: int
@@ -650,15 +655,18 @@ class ForecastScenario:
     annual_return: Decimal
     monthly_rate: Decimal
     monthly_contribution: Decimal
+    starting_value: Decimal
+    historical_contributions: Decimal
     total_contributions: Decimal
     final_value: Decimal
     growth: Decimal
     years: tuple[ForecastYear, ...]
 
 
-def forecast(monthly: Decimal, years: int, annual_return: Decimal, start_value: Decimal = ZERO) -> ForecastScenario:
-    if monthly < ZERO or start_value < ZERO:
-        raise GrowthLedgerError("Monatsrate und Startwert dürfen nicht negativ sein.")
+def forecast(monthly: Decimal, years: int, annual_return: Decimal, start_value: Decimal = ZERO,
+             historical_contributions: Decimal = ZERO) -> ForecastScenario:
+    if monthly < ZERO or start_value < ZERO or historical_contributions < ZERO:
+        raise GrowthLedgerError("Monatsrate, Startwert und bisherige Einzahlungen dürfen nicht negativ sein.")
     if years <= 0 or years > 200:
         raise GrowthLedgerError("Laufzeit muss zwischen 1 und 200 Jahren liegen.")
     if annual_return <= Decimal("-100"):
@@ -671,10 +679,13 @@ def forecast(monthly: Decimal, years: int, annual_return: Decimal, start_value: 
         for month_index in range(1, years * 12 + 1):
             value = value * (Decimal("1") + monthly_rate) + monthly  # Einzahlung am Monatsende
             if month_index % 12 == 0:
-                paid = monthly * month_index
-                rows.append(ForecastYear(month_index // 12, paid, value, value - start_value - paid))
-        paid = monthly * years * 12
-        return ForecastScenario(annual_return, monthly_rate, monthly, paid, value, value - start_value - paid, tuple(rows))
+                future_paid = monthly * month_index
+                rows.append(ForecastYear(month_index // 12, historical_contributions + future_paid,
+                                         value, value - start_value - future_paid))
+        future_paid = monthly * years * 12
+        return ForecastScenario(annual_return, monthly_rate, monthly, start_value, historical_contributions,
+                                historical_contributions + future_paid, value,
+                                value - start_value - future_paid, tuple(rows))
 
 
 def make_manual_transaction(args: argparse.Namespace, *, interactive: bool = True) -> Transaction:
@@ -837,10 +848,16 @@ def forecast_chart(scenarios: Sequence[tuple[str, ForecastScenario]]) -> None:
     header = f"{'Jahr':>4} | {'Einzahlungen kum.':>18}" + "".join(f" | {label:>14}" for label, _ in scenarios)
     print(header)
     print("-" * len(header))
+    first = scenarios[0][1]
+    today_values = "".join(
+        f" | {(number(scenario.starting_value, 2) if label.startswith(('Histor.', 'Manuell')) else ''):>14}"
+        for label, scenario in scenarios
+    )
+    print(f"{'Heute':>4} | {number(first.historical_contributions, 2):>18}{today_values}")
     for index, base_row in enumerate(scenarios[0][1].years):
         values = "".join(f" | {number(scenario.years[index].value, 2):>14}" for _, scenario in scenarios)
         print(f"{base_row.year:>4} | {number(base_row.contributions, 2):>18}{values}")
-    print("Alle Beträge in EUR; Einzahlungen sind die künftig geplanten kumulierten Sparraten.")
+    print("Alle Beträge in EUR; Einzahlungen = tatsächliche CSV-Einzahlungen bisher + künftig geplante Sparraten.")
 
 
 def chart_data(transactions: Sequence[Transaction]) -> tuple[list[tuple[str, Decimal]], list[tuple[str, Decimal]]]:
@@ -1071,8 +1088,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "forecast":
             monthly = parse_decimal(args.monthly, "monthly", allow_empty=False)
             transactions = storage.load()
-            current_value = summarize(transactions).portfolio_value
+            summary = summarize(transactions)
+            current_value = summary.portfolio_value
             start = parse_decimal(args.start_value, "start_value") if args.start_value is not None else (current_value or ZERO)
+            historical_paid = contribution_baseline(summary) if args.start_value is None else ZERO
             if args.single_return is not None:
                 raw_rates = [args.single_return]
             elif args.returns:
@@ -1086,7 +1105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     print("Keine ausreichende Marktpreishistorie; Vergleich verwendet 3 %, 5 % und 7 %.")
                 raw_rates = list(dict.fromkeys(raw_rates))
-            scenarios = [forecast(monthly, args.years, parse_decimal(rate, "return", allow_empty=False), start) for rate in raw_rates]
+            scenarios = [forecast(monthly, args.years, parse_decimal(rate, "return", allow_empty=False),
+                                  start, historical_paid) for rate in raw_rates]
             print_forecasts(scenarios)
         elif args.command == "chart":
             transactions = storage.load()
@@ -1101,19 +1121,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             if summary.portfolio_value is not None:
                 print(f"Kursgewinn/-verlust gegenüber ETF-Kaufbeträgen: {money(summary.portfolio_value - summary.buy_amounts)}")
             calculated_return = historical_annual_return(transactions)
+            historical_paid = contribution_baseline(summary)
             monthly = parse_decimal(args.monthly, "monthly", allow_empty=False)
             if args.annual_return is not None:
                 annual_return = parse_decimal(args.annual_return, "return", allow_empty=False)
-                scenario_pairs = [(f"Manuell {number(annual_return, 2)}%", forecast(monthly, args.years, annual_return, summary.portfolio_value or ZERO))]
+                scenario_pairs = [(f"Manuell {number(annual_return, 2)}%", forecast(
+                    monthly, args.years, annual_return, summary.portfolio_value or ZERO, historical_paid))]
                 print(f"Prognoserendite (manuell): {number(annual_return, 2)} % p. a.")
             else:
                 scenario_pairs: list[tuple[str, ForecastScenario]] = []
                 if calculated_return is not None:
-                    scenario_pairs.append((f"Histor. {number(calculated_return, 2)}%", forecast(monthly, args.years, calculated_return, summary.portfolio_value or ZERO)))
+                    scenario_pairs.append((f"Histor. {number(calculated_return, 2)}%", forecast(
+                        monthly, args.years, calculated_return, summary.portfolio_value or ZERO, historical_paid)))
                     print(f"Historische annualisierte Kurssteigerung: {number(calculated_return, 2)} % p. a.")
                 for fixed_rate in (Decimal("3"), Decimal("5"), Decimal("7")):
                     if calculated_return is None or abs(calculated_return - fixed_rate) > Decimal("0.005"):
-                        scenario_pairs.append((f"{number(fixed_rate, 0)} %", forecast(monthly, args.years, fixed_rate, summary.portfolio_value or ZERO)))
+                        scenario_pairs.append((f"{number(fixed_rate, 0)} %", forecast(
+                            monthly, args.years, fixed_rate, summary.portfolio_value or ZERO, historical_paid)))
             print(f"Prognoseannahme: künftig {money(scenario_pairs[0][1].monthly_contribution)} pro Monat; historische Transaktionen bleiben unverändert.")
             forecast_chart(scenario_pairs)
             print("\nPrognose ist unverbindlich, keine Finanzberatung oder Garantie; Verluste sind möglich.")

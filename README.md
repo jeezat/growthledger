@@ -131,7 +131,7 @@ Für Prognosen gilt die effektive Monatsrendite
 monthly_rate = (1 + annual_rate) ** (1 / 12) - 1
 ```
 
-Der Startwert verzinst sich monatlich; die Sparrate wird jeweils **am Monatsende** hinzugefügt. Angezeigt werden kumulierte Einzahlungen, Endwert und modellierter Wertzuwachs pro Jahr und Szenario.
+Der Startwert verzinst sich monatlich; die Sparrate wird jeweils **am Monatsende** hinzugefügt. Die Spalte „Einzahlungen kum.“ beginnt mit den tatsächlich importierten Kontoeinzahlungen und addiert anschließend die geplanten künftigen Sparraten. Sind keine Kontoeinzahlungen vorhanden, dienen die ETF-Kaufbeträge als Fallback. Der bestehende Depotwert bleibt Startkapital und wird dadurch nicht doppelt addiert.
 
 ### Speicherung und Exportformat
 
@@ -183,7 +183,7 @@ Nach mindestens zwei Marktpreisen über mindestens 30 Tage zeigt `chart` standar
 - Automatische Kurse werden ausschließlich als `market_price` mit Anbieter, Kursdatum, Abrufzeitpunkt und `price_capture=automatic` gespeichert. Broker-Kauf- und Verkaufskurse bleiben unverändert.
 - Gegenüberstellung von ETF-Kaufbeträgen und Depotwert inklusive Kursgewinn oder -verlust.
 - Annualisierte historische Kurssteigerung (CAGR) sowie Prognosevergleich mit historischem Wert, 3 %, 5 % und 7 %.
-- Prognosetabelle mit kumulierten künftigen Einzahlungen und prognostiziertem Depotwert je Jahr; vorhandenes Depotvermögen bleibt getrenntes Startkapital.
+- Prognosetabelle mit tatsächlichen bisherigen CSV-Einzahlungen plus kumulierten künftigen Sparraten und prognostiziertem Depotwert je Jahr; vorhandenes Depotvermögen bleibt getrenntes Startkapital.
 - Sicherer Umgang mit Netzwerk-, API-, Symbol- und Ratenlimitfehlern sowie erweiterte netzwerkfreie Tests für beide Anbieter.
 
 ### Tests und Mitwirkung
@@ -332,7 +332,7 @@ Forecasts use the effective monthly rate:
 monthly_rate = (1 + annual_rate) ** (1 / 12) - 1
 ```
 
-The starting value compounds monthly; the savings contribution is added at the **end of each month**. Cumulative contributions, final value, and modelled growth are displayed for every year and scenario.
+The starting value compounds monthly; the savings contribution is added at the **end of each month**. The “cumulative contributions” column starts with actual imported cash deposits and then adds planned future savings contributions. ETF purchase amounts are used as a fallback when no cash deposits exist. The current portfolio value remains starting capital and is therefore not added twice.
 
 ### Storage and export format
 
@@ -384,7 +384,7 @@ After at least two market prices spanning at least 30 days, `chart` shows a defa
 - Automatic prices are stored only as `market_price`, including provider, price date, retrieval timestamp, and `price_capture=automatic`. Broker purchase and sale prices remain unchanged.
 - Comparison of ETF purchase amounts and portfolio value, including price gain or loss.
 - Annualised historical price growth (CAGR) plus a forecast comparison using the historical value, 3%, 5%, and 7%.
-- Forecast table with cumulative future contributions and projected portfolio value for every year; existing portfolio value remains separate starting capital.
+- Forecast table with actual previous CSV deposits plus cumulative future savings contributions and projected portfolio value for every year; existing portfolio value remains separate starting capital.
 - Safe handling of network, API, symbol, and rate-limit errors, plus extended network-free tests for both providers.
 
 ### Tests and contributing
